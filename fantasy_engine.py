@@ -59,8 +59,9 @@ def normalize_name(name) -> str:
 
 
 # Role suffixes that appear in BattingCard/BowlingCard but NOT in OutDesc
+# Matches one or more suffixes like (c)(wk) or (IP)
 _ROLE_SUFFIX_RE = re.compile(
-    r"\s*\((?:wk|c|IP|RP|WK|C)\)$", re.IGNORECASE
+    r"(?:\s*\((?:wk|c|IP|RP|WK|C)\))+$", re.IGNORECASE
 )
 
 
@@ -94,13 +95,13 @@ def _build_base_to_canonical(batting_card: list, bowling_card: list) -> dict:
     return lookup
 
 
-def _resolve_fielder(raw_name: str, lookup: dict) -> str:
+def _resolve_player(raw_name: str, lookup: dict) -> str:
     """
-    Given a raw fielder name from OutDesc (may lack suffix), return
+    Given a raw player name (which may lack a suffix), return
     the canonical name from the player lookup, or the normalized name
-    if no match found.
+    if no match found. Uses base_name for mapping.
     """
-    norm = normalize_name(raw_name).lstrip("\u2020").strip()  # strip dagger
+    norm = normalize_name(raw_name).lstrip("†").strip()  # strip dagger
     # Direct hit (name already has suffix)
     if norm in lookup.values():
         return norm
@@ -120,7 +121,7 @@ def _unwrap(innings_dict: dict | None, key: str) -> dict:
 # Batting points
 # ---------------------------------------------------------------------------
 
-def _batting_points(bat: dict) -> int:
+def _batting_points(bat: dict, is_bowler: bool) -> int:
     runs        = _safe_int(bat.get("Runs"))
     balls_faced = _safe_int(bat.get("Balls"))
     fours       = _safe_int(bat.get("Fours"))
@@ -142,8 +143,10 @@ def _batting_points(bat: dict) -> int:
     elif runs >= 25:
         pts += 4
 
-    # Duck
-    if is_out and runs == 0:
+    # Duck penalty: -2 only for Batters, WKs, and ARs. 
+    # The `is_bowler` flag is passed in (based on batting order + bowling data)
+    # Bowlers get 0 penalty for a duck.
+    if is_out and runs == 0 and not is_bowler:
         pts -= 2
 
     # Strike rate (applies only when min criteria met)
@@ -226,7 +229,7 @@ def _parse_fielding(manhattan_wkts: list, innings_no: int, lookup: dict) -> dict
     fielding: dict[str, dict] = {}
 
     def _add(raw: str, key: str):
-        name = _resolve_fielder(raw, lookup)
+        name = _resolve_player(raw, lookup)
         if not name:
             return
         rec = fielding.setdefault(name, {
@@ -281,10 +284,10 @@ def _parse_fielding(manhattan_wkts: list, innings_no: int, lookup: dict) -> dict
     return fielding
 
 
-def _parse_lbw_bowled(over_history: list, innings_no: int) -> dict:
+def _parse_lbw_bowled(over_history: list, innings_no: int, lookup: dict) -> dict:
     """
     Count LBW/Bowled wickets per bowler from OverHistory (filtered by InningsNo).
-    Returns {normalized_bowler_name: count}
+    Returns {canonical_bowler_name: count}
     """
     result: dict[str, int] = {}
     for ball in over_history:
@@ -296,7 +299,7 @@ def _parse_lbw_bowled(over_history: list, innings_no: int) -> dict:
             continue
         wtype = str(ball.get("WicketType", "")).strip().lower()
         if wtype in ("lbw", "bowled"):
-            bowler = normalize_name(ball.get("BowlerName", ""))
+            bowler = _resolve_player(ball.get("BowlerName", ""), lookup)
             if bowler:
                 result[bowler] = result.get(bowler, 0) + 1
     return result
@@ -369,21 +372,31 @@ def calculate_points(innings1_raw: dict | None, innings2_raw: dict | None) -> li
         mw           = inn_data.get("ManhattanWickets", []) or []
 
         # LBW/Bowled counts per bowler (filtered to this innings)
-        lbw_bowled_map = _parse_lbw_bowled(over_history, inn_no)
+        lbw_bowled_map = _parse_lbw_bowled(over_history, inn_no, global_lookup)
 
         # Fielding credits — use global lookup, filtered to this innings only
         fielding_stats = _parse_fielding(mw, inn_no, global_lookup)
 
         # --- Batting ---
-        for bat in batting_card:
-            name = normalize_name(bat.get("PlayerName", ""))
+        bowler_names = {_resolve_player(b.get("PlayerName", ""), global_lookup) for b in bowling_card}
+
+        for idx, bat in enumerate(batting_card):
+            name = _resolve_player(bat.get("PlayerName", ""), global_lookup)
             if not name:
                 continue
-            _ensure(name, batting_team)["bat"] += _batting_points(bat)
+
+            # Heuristic for "Pure Bowler" (Duck penalty bypass):
+            # A player is classified as a pure bowler if they bat at position 8 or below (index 7+)
+            # AND they actually bowled in the match (are in the BowlingCard).
+            # If they have "(wk)" in their name, they are never a pure bowler.
+            is_wk = "(wk)" in name.lower()
+            is_pure_bowler = (idx >= 7) and (name in bowler_names) and not is_wk
+
+            _ensure(name, batting_team)["bat"] += _batting_points(bat, is_bowler=is_pure_bowler)
 
         # --- Bowling ---
         for bowl in bowling_card:
-            name = normalize_name(bowl.get("PlayerName", ""))
+            name = _resolve_player(bowl.get("PlayerName", ""), global_lookup)
             if not name:
                 continue
             rec = _ensure(name, bowling_team)
@@ -400,15 +413,15 @@ def calculate_points(innings1_raw: dict | None, innings2_raw: dict | None) -> li
         # --- Playing XI: anyone in batting or bowling card ---
         playing_names: set[str] = set()
         for bat in batting_card:
-            n = normalize_name(bat.get("PlayerName", ""))
+            n = _resolve_player(bat.get("PlayerName", ""), global_lookup)
             if n:
                 playing_names.add(n)
         for bowl in bowling_card:
-            n = normalize_name(bowl.get("PlayerName", ""))
+            n = _resolve_player(bowl.get("PlayerName", ""), global_lookup)
             if n:
                 playing_names.add(n)
 
-        batting_names = {normalize_name(b.get("PlayerName", "")) for b in batting_card}
+        batting_names = {_resolve_player(b.get("PlayerName", ""), global_lookup) for b in batting_card}
         for name in playing_names:
             team = batting_team if name in batting_names else bowling_team
             _ensure(name, team)["play"] = 4   # set (not cumulate)
