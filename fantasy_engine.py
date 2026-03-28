@@ -1,13 +1,20 @@
 """
 fantasy_engine.py — Dream11-style fantasy point calculator.
 
-Input:  innings1 dict  (full parsed JSON from Innings1.js)
-        innings2 dict  (full parsed JSON from Innings2.js)
-        Both dicts are wrapped under 'Innings1'/'Innings2' key respectively.
+Input:  innings1_raw dict  { "Innings1": { "BattingCard": [...], ... } }
+        innings2_raw dict  { "Innings2": { "Innings2": { ... } } }
 
 Output: sorted list of player dicts with full breakdown + rank.
+
+Key design choices:
+  - Player names are normalized (collapse whitespace) to avoid duplicate
+    records caused by API inconsistencies like "Jacob Duffy  (RP)" vs
+    "Jacob Duffy (RP)".
+  - ManhattanWickets is filtered by InningsNo so wickets from the OTHER
+    innings don't get double-counted when both feeds embed full-match data.
 """
 
+import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,8 +23,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-SR_MIN_BALLS = 10
-SR_MIN_RUNS  = 20
+SR_MIN_BALLS  = 10
+SR_MIN_RUNS   = 20
 ECO_MIN_OVERS = 2.0   # floating overs
 
 
@@ -32,56 +39,96 @@ def _safe_int(val, default=0) -> int:
         return default
 
 
-def _safe_float(val, default=0.0) -> float:
-    try:
-        return float(val) if val not in (None, "", "null") else default
-    except (TypeError, ValueError):
-        return default
-
-
 def _overs_to_balls(overs_val) -> int:
-    """Convert '3.2' → 20 balls, '4' → 24 balls (IPL over notation)."""
+    """Convert IPL over notation '3.2' → 20 balls, '4' → 24 balls."""
     try:
-        overs = float(overs_val) if overs_val else 0.0
+        overs   = float(overs_val) if overs_val else 0.0
         full    = int(overs)
-        partial = round((overs - full) * 10)   # e.g. 3.2 → 2 extra balls
+        partial = round((overs - full) * 10)
         return full * 6 + partial
     except (TypeError, ValueError):
         return 0
 
 
+def normalize_name(name) -> str:
+    """
+    Collapse multiple spaces so 'Jacob Duffy  (RP)' == 'Jacob Duffy (RP)'.
+    Keeps role suffixes like (wk), (c), (IP), (RP) as part of the name.
+    """
+    return " ".join(str(name or "").split()).strip()
+
+
+# Role suffixes that appear in BattingCard/BowlingCard but NOT in OutDesc
+_ROLE_SUFFIX_RE = re.compile(
+    r"\s*\((?:wk|c|IP|RP|WK|C)\)$", re.IGNORECASE
+)
+
+
+def base_name(name: str) -> str:
+    """
+    Strip trailing role suffixes so 'Jitesh Sharma (wk)' → 'Jitesh Sharma'
+    and 'Devdutt Padikkal (IP)' → 'Devdutt Padikkal'.
+    Used to match OutDesc fielder names (which have no suffixes) against
+    canonical card names.
+    """
+    return _ROLE_SUFFIX_RE.sub("", normalize_name(name)).strip()
+
+
+def _build_base_to_canonical(batting_card: list, bowling_card: list) -> dict:
+    """
+    Build {base_name: canonical_normalized_name} lookup from card data.
+    When a fielder appears in OutDesc without a suffix, we resolve them
+    to their full canonical name (e.g. 'Jitesh Sharma' → 'Jitesh Sharma (wk)').
+    """
+    lookup: dict[str, str] = {}
+    for card in (batting_card, bowling_card):
+        for entry in card:
+            canonical = normalize_name(entry.get("PlayerName", ""))
+            if not canonical:
+                continue
+            b = base_name(canonical)
+            # Prefer the name WITH a suffix (more informative)
+            existing = lookup.get(b)
+            if existing is None or len(canonical) > len(existing):
+                lookup[b] = canonical
+    return lookup
+
+
+def _resolve_fielder(raw_name: str, lookup: dict) -> str:
+    """
+    Given a raw fielder name from OutDesc (may lack suffix), return
+    the canonical name from the player lookup, or the normalized name
+    if no match found.
+    """
+    norm = normalize_name(raw_name).lstrip("\u2020").strip()  # strip dagger
+    # Direct hit (name already has suffix)
+    if norm in lookup.values():
+        return norm
+    # Try base name match
+    b = base_name(norm)
+    return lookup.get(b, norm)
+
+
 def _unwrap(innings_dict: dict | None, key: str) -> dict:
-    """
-    The feed wraps data under 'Innings1' or 'Innings2' key.
-    E.g.  { 'Innings1': { 'BattingCard': [...], ... } }
-    Returns the inner dict, or {} if missing.
-    """
+    """Return inner innings dict, e.g. innings1_raw['Innings1']."""
     if not innings_dict:
         return {}
     return innings_dict.get(key, {})
 
 
 # ---------------------------------------------------------------------------
-# Batting
+# Batting points
 # ---------------------------------------------------------------------------
 
 def _batting_points(bat: dict) -> int:
-    """
-    BattingCard fields used:
-      PlayerName, Runs, Balls (= balls faced), Fours, Sixes,
-      OutDesc (e.g. 'not out', 'lbw', 'b Bumrah', 'c Kohli b ...')
-    """
     runs        = _safe_int(bat.get("Runs"))
     balls_faced = _safe_int(bat.get("Balls"))
     fours       = _safe_int(bat.get("Fours"))
     sixes       = _safe_int(bat.get("Sixes"))
     out_desc    = str(bat.get("OutDesc") or bat.get("ShortOutDesc") or "").strip().lower()
+    is_out      = out_desc not in ("", "not out", "dnb", "did not bat")
 
-    # Dismissed if OutDesc is not 'not out' / empty / 'dnb'
-    is_out = out_desc not in ("", "not out", "dnb", "did not bat")
-
-    pts = 0
-    pts += runs  * 1
+    pts  = runs * 1
     pts += fours * 4
     pts += sixes * 6
 
@@ -121,29 +168,21 @@ def _batting_points(bat: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Bowling — from BowlingCard
+# Bowling points
 # ---------------------------------------------------------------------------
 
 def _bowling_points(bowl: dict, lbw_bowled_count: int) -> int:
-    """
-    BowlingCard fields used:
-      PlayerName, Overs, Maidens, Runs, Wickets, DotBalls
-    lbw_bowled_count: derived separately from OverHistory.
-    """
     wickets    = _safe_int(bowl.get("Wickets"))
     maidens    = _safe_int(bowl.get("Maidens"))
     runs_given = _safe_int(bowl.get("Runs"))
-    overs_raw  = bowl.get("Overs", 0)
     dots       = _safe_int(bowl.get("DotBalls"))
-
-    balls_bowled  = _overs_to_balls(overs_raw)
+    balls_bowled  = _overs_to_balls(bowl.get("Overs", 0))
     overs_decimal = balls_bowled / 6.0
 
-    pts = 0
-    pts += dots    * 1
+    pts  = dots    * 1
     pts += wickets * 30
     pts += maidens * 12
-    pts += lbw_bowled_count * 8   # LBW / Bowled bonus
+    pts += lbw_bowled_count * 8
 
     # Haul bonuses
     if wickets >= 5:
@@ -175,24 +214,19 @@ def _bowling_points(bowl: dict, lbw_bowled_count: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Fielding — derived from OverHistory
+# Fielding — derived from ManhattanWickets OutDesc
 # ---------------------------------------------------------------------------
 
-def _parse_fielding_and_lbw(over_history: list) -> tuple[dict, dict]:
+def _parse_fielding(manhattan_wkts: list, innings_no: int, lookup: dict) -> dict:
     """
-    Parse OverHistory balls to extract:
-      - fielding: {player_name: {catches, stumpings, run_out_direct, run_out_indirect}}
-      - lbw_bowled_map: {bowler_name: count_of_lbw_or_bowled_wickets}
-
-    OverHistory field used:
-      WicketType (string), IsBowlerWicket ('1'/'0'), BowlerName,
-      IsWicket ('1'/'0').
+    Parse ManhattanWickets to extract fielding contributions.
+    Uses lookup to resolve OutDesc names (no suffix) to canonical names (with suffix).
+    Filters by InningsNo to prevent double-counting.
     """
     fielding: dict[str, dict] = {}
-    lbw_bowled_map: dict[str, int] = {}
 
-    def _add_field(name: str, key: str):
-        name = (name or "").strip()
+    def _add(raw: str, key: str):
+        name = _resolve_fielder(raw, lookup)
         if not name:
             return
         rec = fielding.setdefault(name, {
@@ -201,123 +235,71 @@ def _parse_fielding_and_lbw(over_history: list) -> tuple[dict, dict]:
         })
         rec[key] += 1
 
-    for ball in over_history:
-        is_wicket = str(ball.get("IsWicket", "0")).strip() == "1"
-        if not is_wicket:
+    for entry in manhattan_wkts:
+        # Filter to only process wickets for this innings
+        row_innings = _safe_int(entry.get("InningsNo"), default=-1)
+        if row_innings != innings_no:
             continue
 
-        wtype        = str(ball.get("WicketType", "")).strip().lower()
-        bowler_name  = str(ball.get("BowlerName", "")).strip()
-        # Some feeds include a Fielder name — use BatsManName context isn't useful here
-        # WicketType values seen: 'caught', 'bowled', 'lbw', 'stumped',
-        #   'run out', 'caught and bowled', 'hit wicket', 'obstructing the field'
-
-        if wtype in ("lbw", "bowled"):
-            if bowler_name:
-                lbw_bowled_map[bowler_name] = lbw_bowled_map.get(bowler_name, 0) + 1
-
-        elif wtype == "caught":
-            # The fielder name isn't always in OverHistory;
-            # fall back to BowlerName only for "caught and bowled"
-            pass   # handled via ManhattanWickets below
-
-        elif wtype == "caught and bowled":
-            _add_field(bowler_name, "catches")
-
-        elif wtype == "stumped":
-            # Stumping — no fielder name in OverHistory usually
-            pass
-
-        elif wtype == "run out":
-            pass   # handled below
-
-    return fielding, lbw_bowled_map
-
-
-def _parse_fielding_from_manhattan(manhattan_wickets: list,
-                                   fall_of_wickets: list) -> dict:
-    """
-    ManhattanWickets fields:
-      OutBatsman, OutDesc, BatsmanRuns, BatsmanBalls
-
-    OutDesc examples:
-      "c Kohli b Bumrah", "st †Saha b Chahal", "run out (Sharma)",
-      "lbw b Kumar", "b Bumrah", "c & b Shami"
-
-    Returns fielding dict: {player_name: {catches, stumpings, run_out_direct, run_out_indirect}}
-    """
-    import re
-    fielding: dict[str, dict] = {}
-
-    def _add(name: str, key: str):
-        name = (name or "").strip()
-        # Strip keeper dagger
-        name = name.lstrip("†").strip()
-        if not name:
-            return
-        rec = fielding.setdefault(name, {
-            "catches": 0, "stumpings": 0,
-            "run_out_direct": 0, "run_out_indirect": 0,
-        })
-        rec[key] += 1
-
-    for entry in manhattan_wickets:
-        desc = str(entry.get("OutDesc", "")).strip().lower()
+        desc = str(entry.get("OutDesc", "")).strip()
         if not desc:
             continue
 
-        # caught and bowled
-        if re.match(r"c\s*&\s*b\s+", desc):
-            m = re.match(r"c\s*&\s*b\s+(.+)", desc)
-            if m:
-                _add(m.group(1).strip().title(), "catches")
+        desc_lower = desc.lower()
 
-        # caught
-        elif desc.startswith("c ") and " b " in desc:
-            # "c Kohli b Bumrah"
-            m = re.match(r"c\s+(.+?)\s+b\s+", desc)
+        # caught and bowled  →  "c & b BowlerName"
+        if re.match(r"c\s*&\s*b\s+", desc_lower):
+            m = re.match(r"c\s*&\s*b\s+(.+)", desc, re.IGNORECASE)
+            if m:
+                _add(m.group(1).strip(), "catches")
+
+        # caught  →  "c FielderName b BowlerName"
+        elif desc_lower.startswith("c ") and " b " in desc_lower:
+            m = re.match(r"c\s+(.+?)\s+b\s+", desc, re.IGNORECASE)
             if m:
                 fielder = m.group(1).strip()
                 if fielder.lower() not in ("", "sub"):
-                    _add(fielder.title(), "catches")
+                    _add(fielder, "catches")
 
-        # stumped
-        elif desc.startswith("st "):
-            # "st †Saha b Chahal"
-            m = re.match(r"st\s+[†]?(.+?)\s+b\s+", desc)
+        # stumped  →  "st †KeeperName b BowlerName"
+        elif desc_lower.startswith("st "):
+            m = re.match(r"st\s+[†]?(.+?)\s+b\s+", desc, re.IGNORECASE)
             if m:
-                _add(m.group(1).strip().title(), "stumpings")
+                _add(m.group(1).strip(), "stumpings")
 
-        # run out
-        elif "run out" in desc:
-            # "run out (Sharma/Chahal)" or "run out (Sharma)"
+        # run out  →  "run out (FielderA/FielderB)" or "run out (FielderA)"
+        elif "run out" in desc_lower:
             m = re.search(r"\((.+?)\)", desc)
             if m:
                 names = m.group(1).split("/")
                 if len(names) == 1:
-                    _add(names[0].strip().title(), "run_out_direct")
+                    _add(names[0].strip(), "run_out_direct")
                 else:
-                    # First is direct, second is indirect
-                    _add(names[0].strip().title(), "run_out_direct")
-                    _add(names[1].strip().title(), "run_out_indirect")
-            else:
-                pass  # can't parse, skip
+                    _add(names[0].strip(), "run_out_direct")
+                    _add(names[1].strip(), "run_out_indirect")
 
     return fielding
 
 
-def _merge_fielding(*dicts) -> dict:
-    """Merge multiple fielding dicts, summing counts."""
-    merged: dict[str, dict] = {}
-    for d in dicts:
-        for name, stats in d.items():
-            rec = merged.setdefault(name, {
-                "catches": 0, "stumpings": 0,
-                "run_out_direct": 0, "run_out_indirect": 0,
-            })
-            for k in rec:
-                rec[k] += stats.get(k, 0)
-    return merged
+def _parse_lbw_bowled(over_history: list, innings_no: int) -> dict:
+    """
+    Count LBW/Bowled wickets per bowler from OverHistory (filtered by InningsNo).
+    Returns {normalized_bowler_name: count}
+    """
+    result: dict[str, int] = {}
+    for ball in over_history:
+        row_innings = _safe_int(ball.get("InningsNo"), default=-1)
+        if row_innings != innings_no:
+            continue
+        is_wicket = str(ball.get("IsWicket", "0")).strip() == "1"
+        if not is_wicket:
+            continue
+        wtype = str(ball.get("WicketType", "")).strip().lower()
+        if wtype in ("lbw", "bowled"):
+            bowler = normalize_name(ball.get("BowlerName", ""))
+            if bowler:
+                result[bowler] = result.get(bowler, 0) + 1
+    return result
 
 
 def _fielding_points(catches: int, stumpings: int,
@@ -336,66 +318,78 @@ def _fielding_points(catches: int, stumpings: int,
 
 def calculate_points(innings1_raw: dict | None, innings2_raw: dict | None) -> list[dict]:
     """
-    Calculate Dream11 fantasy points.
-    innings1_raw / innings2_raw are the full parsed dicts from the feeds,
-    e.g. { "Innings1": { "BattingCard": [...], ... } }
-
-    Returns ranked list of player dicts.
+    Calculate Dream11 fantasy points from one or two innings dicts.
+    Returns a ranked list of player records.
     """
     innings1 = _unwrap(innings1_raw, "Innings1")
     innings2 = _unwrap(innings2_raw, "Innings2")
 
-    players: dict[str, dict] = {}   # player_name → record
+    # normalized_name → record
+    players: dict[str, dict] = {}
 
     def _ensure(name: str, team: str) -> dict:
-        if name not in players:
-            players[name] = {
-                "player": name,
+        key = normalize_name(name)
+        if key not in players:
+            players[key] = {
+                "player": key,      # store normalized name
                 "team": team,
                 "bat": 0, "bowl": 0, "field": 0, "play": 4,
                 "total": 0,
                 "catches": 0, "stumpings": 0,
                 "run_out_direct": 0, "run_out_indirect": 0,
             }
-        return players[name]
+        return players[key]
 
-    # ---------- process each innings -----------
-    for inn_data, inn_label in [(innings1, "Innings1"), (innings2, "Innings2")]:
+    # Build GLOBAL name lookup from ALL cards across both innings.
+    # This is critical: fielders in Innings2 may only appear in Innings1's
+    # BattingCard (e.g. Devdutt Padikkal (IP) bats in Inn1, fields in Inn2).
+    all_batting1  = innings1.get("BattingCard", []) or []
+    all_bowling1  = innings1.get("BowlingCard", []) or []
+    all_batting2  = innings2.get("BattingCard", []) or []
+    all_bowling2  = innings2.get("BowlingCard", []) or []
+    global_lookup = _build_base_to_canonical(
+        all_batting1 + all_batting2,
+        all_bowling1 + all_bowling2,
+    )
+
+    # Process each innings
+    for inn_data, inn_label, inn_no in [
+        (innings1, "Innings1", 1),
+        (innings2, "Innings2", 2),
+    ]:
         if not inn_data:
             continue
 
-        extras        = (inn_data.get("Extras") or [{}])[0]
-        batting_team  = str(extras.get("BattingTeamName", "")).strip()
-        bowling_team  = str(extras.get("BowlingTeamName", "")).strip()
-        batting_card  = inn_data.get("BattingCard", []) or []
-        bowling_card  = inn_data.get("BowlingCard", []) or []
-        over_history  = inn_data.get("OverHistory", []) or []
-        manhattan_wkts= inn_data.get("ManhattanWickets", []) or []
+        extras       = (inn_data.get("Extras") or [{}])[0]
+        batting_team = str(extras.get("BattingTeamName", "")).strip()
+        bowling_team = str(extras.get("BowlingTeamName", "")).strip()
+        batting_card = inn_data.get("BattingCard", []) or []
+        bowling_card = inn_data.get("BowlingCard", []) or []
+        over_history = inn_data.get("OverHistory", []) or []
+        mw           = inn_data.get("ManhattanWickets", []) or []
 
-        # --- LBW/bowled counts per bowler (from OverHistory) ---
-        _, lbw_bowled_map = _parse_fielding_and_lbw(over_history)
+        # LBW/Bowled counts per bowler (filtered to this innings)
+        lbw_bowled_map = _parse_lbw_bowled(over_history, inn_no)
 
-        # --- Fielding from ManhattanWickets OutDesc ---
-        fielding_stats = _parse_fielding_from_manhattan(manhattan_wkts, [])
+        # Fielding credits — use global lookup, filtered to this innings only
+        fielding_stats = _parse_fielding(mw, inn_no, global_lookup)
 
         # --- Batting ---
         for bat in batting_card:
-            name = str(bat.get("PlayerName", "")).strip()
+            name = normalize_name(bat.get("PlayerName", ""))
             if not name:
                 continue
-            rec = _ensure(name, batting_team)
-            rec["bat"] += _batting_points(bat)
+            _ensure(name, batting_team)["bat"] += _batting_points(bat)
 
         # --- Bowling ---
         for bowl in bowling_card:
-            name = str(bowl.get("PlayerName", "")).strip()
+            name = normalize_name(bowl.get("PlayerName", ""))
             if not name:
                 continue
             rec = _ensure(name, bowling_team)
-            lbc = lbw_bowled_map.get(name, 0)
-            rec["bowl"] += _bowling_points(bowl, lbc)
+            rec["bowl"] += _bowling_points(bowl, lbw_bowled_map.get(name, 0))
 
-        # --- Fielding credits ---
+        # --- Fielding credits → bowling team fielders ---
         for fielder_name, fstats in fielding_stats.items():
             rec = _ensure(fielder_name, bowling_team)
             rec["catches"]          += fstats["catches"]
@@ -403,23 +397,23 @@ def calculate_points(innings1_raw: dict | None, innings2_raw: dict | None) -> li
             rec["run_out_direct"]   += fstats["run_out_direct"]
             rec["run_out_indirect"] += fstats["run_out_indirect"]
 
-        # --- Playing XI (+4 for appearing in batting/bowling card) ---
+        # --- Playing XI: anyone in batting or bowling card ---
         playing_names: set[str] = set()
         for bat in batting_card:
-            n = str(bat.get("PlayerName", "")).strip()
+            n = normalize_name(bat.get("PlayerName", ""))
             if n:
                 playing_names.add(n)
         for bowl in bowling_card:
-            n = str(bowl.get("PlayerName", "")).strip()
+            n = normalize_name(bowl.get("PlayerName", ""))
             if n:
                 playing_names.add(n)
 
+        batting_names = {normalize_name(b.get("PlayerName", "")) for b in batting_card}
         for name in playing_names:
-            _ensure(name, batting_team if name in {
-                str(b.get("PlayerName", "")).strip() for b in batting_card
-            } else bowling_team)["play"] = 4   # set, not cumulate
+            team = batting_team if name in batting_names else bowling_team
+            _ensure(name, team)["play"] = 4   # set (not cumulate)
 
-    # --- Compute fielding pts + total ---
+    # --- Compute fielding pts and total ---
     for rec in players.values():
         rec["field"] = _fielding_points(
             rec["catches"], rec["stumpings"],
@@ -427,7 +421,7 @@ def calculate_points(innings1_raw: dict | None, innings2_raw: dict | None) -> li
         )
         rec["total"] = rec["bat"] + rec["bowl"] + rec["field"] + rec["play"]
 
-    # --- Sort and rank ---
+    # --- Sort by total descending, assign ranks ---
     sorted_players = sorted(players.values(), key=lambda x: x["total"], reverse=True)
     ranked = []
     current_rank = 1
