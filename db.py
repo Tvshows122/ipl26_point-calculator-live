@@ -1,7 +1,7 @@
 """
 db.py — MongoDB connection singleton using MONGO_URI env variable.
 Database: dream11
-Collections: matches, points
+Collections: matches, points, standings
 """
 
 import os
@@ -40,3 +40,8 @@ def get_matches_collection():
 
 def get_points_collection():
     return get_db()["points"]
+
+
+def get_standings_collection():
+    """IPL official group standings (point table)."""
+    return get_db()["standings"]

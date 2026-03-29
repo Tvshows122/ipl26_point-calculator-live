@@ -25,6 +25,11 @@ from utils import IST, clean_jsonp, hash_data, get_ist_now
 
 app = Flask(__name__)
 
+STANDINGS_URL = (
+    "https://ipl-stats-sports-mechanic.s3.ap-south-1.amazonaws.com"
+    "/ipl/feeds/stats/284-groupstandings.js"
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -240,6 +245,68 @@ def fetch_match(match_id: int):
         "innings2_fetched": innings2 is not None,
         "players":    len(points),
         "data":       points,
+    }), 200
+
+
+@app.get("/standings")
+def get_standings():
+    """
+    Return the latest IPL official point table from MongoDB.
+    This is updated automatically by the worker after each match ends.
+    Use GET /standings/refresh to force-fetch from S3 immediately.
+    """
+    col = db.get_standings_collection()
+    doc = col.find_one({"_id": "ipl2026"}, projection={"_id": 0})
+
+    if doc is None:
+        return _json_error(
+            "No standings in DB yet. Try GET /standings/refresh to fetch now.",
+            status=404,
+        )
+
+    if "updated_at" in doc:
+        doc["updated_at"] = _dt_to_iso(doc["updated_at"])
+
+    return jsonify({
+        "updated_at": doc.get("updated_at"),
+        "teams":      doc.get("data", []),
+    }), 200
+
+
+@app.get("/standings/refresh")
+def refresh_standings():
+    """
+    On-demand: fetch the latest IPL point table from S3 and upsert into MongoDB.
+    Returns the fresh data immediately. Useful for manual refresh or testing.
+    """
+    logger.info("On-demand standings refresh triggered.")
+    try:
+        resp = requests.get(STANDINGS_URL, timeout=_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = clean_jsonp(resp.text)
+        if data is None:
+            return _json_error("Could not parse standings from S3.", status=502)
+        standings = data.get("points", [])
+    except Exception as e:
+        logger.error("Error fetching standings: %s", e)
+        return _json_error(f"Failed to fetch standings: {e}", status=502)
+
+    now = get_ist_now()
+    col = db.get_standings_collection()
+    col.update_one(
+        {"_id": "ipl2026"},
+        {"$set": {
+            "_id":        "ipl2026",
+            "updated_at": now,
+            "data":       standings,
+        }},
+        upsert=True,
+    )
+    logger.info("Standings refreshed manually (%d teams).", len(standings))
+
+    return jsonify({
+        "updated_at": _dt_to_iso(now),
+        "teams":      standings,
     }), 200
 
 

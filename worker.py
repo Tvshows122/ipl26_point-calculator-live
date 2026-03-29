@@ -37,8 +37,15 @@ INNINGS_BASE = (
     "/ipl/feeds/{match_id}-{innings}.js"
 )
 
+STANDINGS_URL = (
+    "https://ipl-stats-sports-mechanic.s3.ap-south-1.amazonaws.com"
+    "/ipl/feeds/stats/284-groupstandings.js"
+)
+
 # Number of consecutive unchanged Innings1 polls before switching to Innings2
 INNINGS1_STALE_THRESHOLD = 3
+# Consecutive unchanged Innings2 polls before treating match as finished
+INNINGS2_STALE_THRESHOLD = 3
 
 POLL_INTERVAL_ACTIVE  = 2    # seconds between polls during match
 POLL_INTERVAL_IDLE    = 60   # seconds to sleep when no active match
@@ -70,6 +77,26 @@ def fetch_innings(match_id: int, innings_label: str) -> tuple[dict | None, str |
     except requests.RequestException as e:
         logger.warning("HTTP error fetching %s (match %s): %s", innings_label, match_id, e)
         return None, None
+
+
+def fetch_standings() -> list[dict] | None:
+    """
+    Fetch the official IPL group standings (point table) from S3.
+    Returns the cleaned list of team dicts, or None on failure.
+    """
+    try:
+        resp = requests.get(STANDINGS_URL, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = clean_jsonp(resp.text)
+        if data is None:
+            logger.warning("Could not parse standings response.")
+            return None
+        standings = data.get("points", [])
+        logger.info("Fetched standings: %d teams.", len(standings))
+        return standings
+    except requests.RequestException as e:
+        logger.warning("HTTP error fetching standings: %s", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +135,20 @@ def upsert_points(match_id: int, points_data: list[dict]):
     logger.info("Upserted fantasy points for match %s (%d players)", match_id, len(points_data))
 
 
+def upsert_standings(standings: list[dict]):
+    col = db.get_standings_collection()
+    col.update_one(
+        {"_id": "ipl2026"},
+        {"$set": {
+            "_id":        "ipl2026",
+            "updated_at": get_ist_now(),
+            "data":       standings,
+        }},
+        upsert=True,
+    )
+    logger.info("Upserted IPL standings (%d teams).", len(standings))
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -120,7 +161,9 @@ def run():
     last_innings1_hash: str | None = None
     last_innings2_hash: str | None = None
     innings1_stale_count: int = 0
+    innings2_stale_count: int = 0
     use_innings2:     bool = False
+    standings_fetched_for_match: int | None = None  # track so we only fetch once per match
 
     # These hold the last good data (to avoid re-fetching on unchanged polls)
     cached_innings1: dict | None = None
@@ -149,6 +192,7 @@ def run():
                 last_innings1_hash = None
                 last_innings2_hash = None
                 innings1_stale_count = 0
+                innings2_stale_count = 0
                 use_innings2      = False
                 cached_innings1   = None
                 cached_innings2   = None
@@ -196,9 +240,16 @@ def run():
                 if innings2_data:
                     innings2_changed = (innings2_hash != last_innings2_hash)
                     if innings2_changed:
+                        innings2_stale_count = 0
                         last_innings2_hash = innings2_hash
                         cached_innings2    = innings2_data
                         logger.info("Innings2 updated (match %s).", match_id)
+                    else:
+                        innings2_stale_count += 1
+                        logger.debug(
+                            "Innings2 unchanged (stale count: %d/%d).",
+                            innings2_stale_count, INNINGS2_STALE_THRESHOLD,
+                        )
 
             # ----------------------------------------------------------------
             # 5. If any data changed → persist + recalculate
@@ -222,6 +273,24 @@ def run():
                     logger.debug(traceback.format_exc())
             else:
                 logger.debug("No data change for match %s. Skipping DB write.", match_id)
+
+            # ----------------------------------------------------------------
+            # 6. Fetch IPL standings once after match is fully complete
+            #    (Innings2 has gone stale = match effectively finished)
+            # ----------------------------------------------------------------
+            match_complete = (
+                use_innings2
+                and innings2_stale_count >= INNINGS2_STALE_THRESHOLD
+                and standings_fetched_for_match != match_id
+            )
+            if match_complete:
+                logger.info("Match %s appears complete. Fetching IPL standings.", match_id)
+                standings = fetch_standings()
+                if standings:
+                    upsert_standings(standings)
+                    standings_fetched_for_match = match_id
+                else:
+                    logger.warning("Standings fetch failed for match %s. Will retry next poll.", match_id)
 
         except Exception as e:
             logger.error("Unexpected worker error: %s", e)
