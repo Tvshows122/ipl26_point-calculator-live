@@ -411,7 +411,6 @@ class FantasyCalculator:
             d["player"] = d.pop("name")
             d["team"] = d.pop("team_name")
             d["total"] = r.total_points
-            del d["player_id"]
             del d["played"]
             out.append(d)
         return out
