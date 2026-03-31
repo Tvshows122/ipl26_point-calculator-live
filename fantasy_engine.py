@@ -100,11 +100,12 @@ def strike_rate_bonus(runs, balls):
 def economy_bonus(er, balls):
     if balls < 12:  # 2 overs minimum for economy bonus/penalty
         return 0
-    if er < 5.0: return 4
-    if er <= 7.0: return 2
-    if er <= 10.0: return 0
-    if er <= 11.0: return -2
-    if er <= 12.0: return -4
+    if er < 5.0: return 6
+    if er < 6.0: return 4
+    if er < 7.0: return 2
+    if er < 10.0: return 0
+    if er < 11.0: return -2
+    if er < 12.0: return -4
     return -6
 
 
