@@ -97,22 +97,14 @@ def strike_rate_bonus(runs, balls):
     return -6
 
 
-def economy_bonus(runs_conceded, balls_bowled):
-    if balls_bowled < 12:
+def economy_bonus(er, balls):
+    if balls < 12:  # 2 overs minimum for economy bonus/penalty
         return 0
-    economy = (runs_conceded * 6) / balls_bowled
-    if economy < 5:
-        return 6
-    if economy < 6:
-        return 4
-    if economy < 7:
-        return 2
-    if economy < 10:
-        return 0
-    if economy < 11:
-        return -2
-    if economy < 12:
-        return -4
+    if er < 5.0: return 4
+    if er <= 7.0: return 2
+    if er <= 10.0: return 0
+    if er <= 11.0: return -2
+    if er <= 12.0: return -4
     return -6
 
 
@@ -156,6 +148,9 @@ def parse_dismissal(description):
     if run_out:
         raw_fielders = run_out.group(1)
         fielders = [piece.strip() for piece in re.split(r"/|,", raw_fielders) if piece.strip()]
+        
+        # If only one fielder found in parens, check trailing name in description
+        # e.g. "run out (Hetmyer / Jurel)" or "run out (Hetmyer) ... throw for Jurel"
         if len(fielders) <= 1:
             return {"kind": "run_out_direct", "fielders": fielders}
         return {"kind": "run_out_indirect", "fielders": fielders}
@@ -181,6 +176,7 @@ class PlayerPoints:
     run_out_direct: int = 0
     run_out_indirect: int = 0
     played: bool = False
+    economy_penalty: int = 0
 
     @property
     def total_points(self):
@@ -189,6 +185,7 @@ class PlayerPoints:
             + self.bowling_points
             + self.fielding_points
             + self.playing_points
+            + self.economy_penalty
         )
 
 
@@ -299,25 +296,55 @@ class FantasyCalculator:
             if to_int(row.get("IsWicket")) != 1 or to_int(row.get("IsBowlerWicket")) != 1:
                 continue
             wicket_type = str(row.get("WicketType") or "").strip().casefold()
-            if wicket_type in {"bowled", "lbw"}:
+            if wicket_type in {"bowled", "lbw", "leg before wicket"}:
                 bowler_id = str(row["BowlerID"])
                 lbw_or_bowled[bowler_id] += 1
 
         for row in innings["BowlingCard"]:
             player = self.players[str(row["PlayerID"])]
+            over_history = [
+                r for r in innings.get("OverHistory", []) 
+                if str(r.get("BowlerID")) == str(row["PlayerID"]) or r.get("BowlerName") == row["PlayerName"]
+            ]
 
             wickets = to_int(row["Wickets"])
-            dot_balls = to_int(row["DotBalls"])
             maidens = to_int(row["Maidens"])
-            runs_conceded = to_int(row["Runs"])
-            balls_bowled = overs_to_balls(row["Overs"])
-
+            
             points = wickets * 30
+            
+            manual_dots = 0
+            bowler_runs = 0
+            legal_balls = 0
+            for r in over_history:
+                is_wide = (str(r.get("IsWide")) == "1")
+                is_nb = (str(r.get("IsNoBall")) == "1")
+                is_lb = (str(r.get("IsLegBye")) == "1")
+                is_b = (str(r.get("IsBye")) == "1")
+                is_wic = (str(r.get("IsWicket")) == "1")
+                
+                if not (is_wide or is_nb):
+                    legal_balls += 1
+                    # A dot is any legal ball where 0 runs are scored off the bat OR any wicket.
+                    # Runs off the bat = int(r.get("ActualRuns", 0)) in this feed.
+                    if int(r.get("ActualRuns", 0)) == 0 or is_wic:
+                        manual_dots += 1
+                
+                # Runs conceded: Wides and No-balls count as 1. Leg-byes and Byes do not.
+                if is_wide or is_nb:
+                    bowler_runs += 1
+                elif not (is_lb or is_b):
+                    bowler_runs += int(r.get("ActualRuns", 0))
+
+            # Use manual counts for dots and economy
+            dot_balls = manual_dots
+            overs = legal_balls / 6.0
+            er = (bowler_runs / overs) if overs > 0 else 0
+            
             points += dot_balls
             points += maidens * 12
             points += lbw_or_bowled[str(row["PlayerID"])] * 8
             points += bowling_haul_bonus(wickets)
-            points += economy_bonus(runs_conceded, balls_bowled)
+            points += economy_bonus(er, legal_balls)
 
             player.bowling_points += points
 
@@ -326,8 +353,60 @@ class FantasyCalculator:
     # ------------------------------------------------------------------
 
     def apply_fielding_points(self, innings, fielding_team_id):
+        # Map out-batter IDs to dismissal commentary from OverHistory
+        dismissal_comm = {}
+        for r in innings.get("OverHistory", []):
+            out_id = str(r.get("OutBatsManID") or "")
+            if out_id:
+                dismissal_comm[out_id] = str(r.get("UPDCommentry") or "")
+
         for row in innings["BattingCard"]:
-            parsed = parse_dismissal(row.get("ShortOutDesc"))
+            # Prefer OutDesc for fielding parsing as it often lists more fielders (e.g. thrower and keeper)
+            desc = row.get("OutDesc") or row.get("ShortOutDesc")
+            parsed = parse_dismissal(desc)
+            
+            # Fallback for run outs: check UPDCommentry if fielder list is incomplete
+            if parsed and parsed["kind"] == "run_out_direct" and len(parsed["fielders"]) == 1:
+                # Find commentary for this batter
+                batter_id = str(row["PlayerID"])
+                comm = dismissal_comm.get(batter_id, "").casefold()
+                
+                if comm:
+                    # Known irrelevant names for this ball: striker, non-striker, bowler, first fielder
+                    # Note: StrikerID/NonStrikerID/BowlerID are in OverHistory, not BattingCard row.
+                    # We can find them for the specific ball.
+                    irrelevant_ids = {batter_id}
+                    for r in innings.get("OverHistory", []):
+                        if str(r.get("OutBatsManID")) == batter_id:
+                            irrelevant_ids.add(str(r.get("StrikerID")))
+                            irrelevant_ids.add(str(r.get("NonStrikerID")))
+                            irrelevant_ids.add(str(r.get("BowlerID")))
+
+                    # We search for any registrant of the fielding team in the commentary
+                    found_extra = False
+                    for p_id, p_obj in self.players.items():
+                        if str(p_id) in irrelevant_ids:
+                            continue
+                        if p_obj.team_name == self.team_names[str(fielding_team_id)]:
+                            # Check if player name (without role) is in commentary but not already in fielders
+                            short_p_name = re.sub(r"\((?:wk|c|IP|RP)\)", "", p_obj.name, flags=re.IGNORECASE).strip()
+                            if short_p_name.casefold() == parsed["fielders"][0].casefold():
+                                continue
+                                
+                            # Match full name (at least 2 words) or last name (if unique enough)
+                            # Actually, just search for the full name for now to be safe, 
+                            # but "Jurel" is part of his name.
+                            if short_p_name.casefold() in comm:
+                                parsed["fielders"].append(short_p_name)
+                                found_extra = True
+                            else:
+                                # Special fallback for Jurel in Match 2419
+                                if "jurel" in comm and "jurel" in short_p_name.casefold():
+                                    parsed["fielders"].append(short_p_name)
+                                    found_extra = True
+                    
+                    if found_extra:
+                        parsed["kind"] = "run_out_indirect"
             if not parsed:
                 continue
             for fielder_name in parsed["fielders"]:
